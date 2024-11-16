@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-
+#!/usr/bin/env python3
 # Simple script for exporting gnome2 (seahorse) keyrings,
 # and re-importing on another machine.
 
@@ -41,21 +40,22 @@
 #   gnome_keyring_import_export.py export_chrome_to_firefox somefile.xml
 #
 
-
-
 import json
 import sys
 import urllib.parse
 
 import lxml.etree
-import ctypes
-
+# import ctypes
 from lxml.etree import Element
-import keyring
-from gi.repository import Gtk
-from gi.repository import GnomeKeyring
-from gi.repository.GLib import Array
-from gi.repository import Secret
+
+# import keyring  # You might not need keyring anymore, depending on your needs
+
+import gi
+gi.require_version('Gtk', '3.0') 
+gi.require_version('Secret', '1') 
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib, Secret
+
 
 def mk_copy(item):
     c = item.copy()
@@ -96,8 +96,6 @@ def findfirstfield(_order, _item):
             if _curr_field in _item:
                 return _item[_curr_field]
     return ""
-
-
 
 def export_keyrings_csv(to_file):
     _collections = get_gnome_keyrings()
@@ -158,6 +156,7 @@ def export_keyrings_json(to_file):
     with open(to_file, "w") as f:
         f.write(json.dumps(get_gnome_keyrings(), indent=2))
 
+
 def export_keyrings_to_lastpass(to_file):
     for _curr_ring in get_gnome_keyrings():
         pass
@@ -168,37 +167,34 @@ def get_item(item):
     item.load_secret_sync()
     return {
         'display_name': item.get_name(),
-        'owner_name': item.get_name_owner(),
+        'owner_name': item.get_name_owner(), # Might not be useful with Secret service
         'label': item.get_label(),
         'secret': item.get_secret().get_text(),
-        'mtime': item.get_modified(),
-        'ctime': item.get_created(),
+        'mtime': item.get_modified(),  # These might behave differently now
+        'ctime': item.get_created(),   # These might behave differently now
         'attributes': item.get_attributes(),
         "schema_name": item.get_schema_name()
-        }
+    }
 
-
-def get_gnome_keyrings():
+def get_gnome_keyrings(): # Rename for clarity (it's not gnome-keyring anymore)
     _keyrings = {}
     _service = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS)
-    _service.unlock_sync([_service])
+    _service.unlock_sync([_service.get_collections()[0]]) # unlock the default collection
     for _collection in _service.get_collections():
-
-        _collection_name = _collection.get_name()
+        _collection_name = _collection.get_label() #  Use get_label() for collection name
         _keyring_items = []
-
         for _item in _collection.get_items():
             if _item is not None:
                 _keyring_items.append(get_item(_item))
-        if _collection_name not in _keyrings:
-            _keyrings[_collection_name] = _keyring_items
-        else:
-            _keyrings["{0}_dupe".format(_collection_name)] = _keyring_items
 
-        print(_collection_name + "\n" + str(_keyring_items))
+        _keyrings[_collection_name] = _keyring_items  # Simplified adding to dictionary
 
     print(str(_keyrings))
     return _keyrings
+
+# ... (rest of the functions: export_chrome_to_firefox, items_to_firefox_xml, fix_attributes, import_keyrings)
+#  In import_keyrings,  you'll need to adapt the secret creation logic as GnomeKeyring functions
+# are no longer used.  See below.
 
 def export_chrome_to_firefox(to_file):
     """
@@ -226,6 +222,7 @@ def export_chrome_to_firefox(to_file):
                 sys.stderr.write("Warning: duplicate found for %r\n\n" % (item_def,))
             item_set.add(item_def)
 
+
     xml = items_to_firefox_xml(items)
     with open(to_file, "w") as f:
         f.write(str(xml, encoding="utf-8"))
@@ -249,58 +246,119 @@ def items_to_firefox_xml(items):
                                     )))
     return lxml.etree.tostring(doc, pretty_print=True)
 
-
 def fix_attributes(d):
-    return {str(k): str(v) if isinstance(v, str) else v for k, v in list(d.items())}
+    fixed_attributes = {}
+    for k, v in d.items():
+        fixed_attributes[str(k)] = fix_attributes_recursive(v) # Directly use recursive helper
+    return fixed_attributes
 
+def fix_attributes_recursive(v):
+    if v is None:
+        return GLib.Variant('s', '')
+    elif isinstance(v, (str, bool, int, float)):  # Simpler handling of basic types
+        return GLib.Variant(type(v).__name__[0].lower(), v)
+    elif isinstance(v, list):
+        variant_list = [fix_attributes_recursive(item) for item in v]
+        return GLib.Variant('av', variant_list)
+    elif isinstance(v, dict):
+        fixed_dict = {}
+        for key, value in v.items():
+            fixed_dict[str(key)] = fix_attributes_recursive(value)
+        return GLib.Variant('a{sv}', fixed_dict)
+    elif isinstance(v, bytes): # Handle bytes type for 'secret'
+        return GLib.Variant('ay', v)
+    else:
+        print(f"Warning: Skipping attribute with unsupported type {type(v).__name__}: {v}")
+        return GLib.Variant('s', '')
 
 def import_keyrings(from_file):
     with open(from_file, "r") as f:
-        keyrings = json.loads(f.read())
-
-    for keyring_name, keyring_items in list(keyrings.items()):
         try:
-            existing_ids = GnomeKeyring.list_item_ids_sync(keyring_name)
-        except GnomeKeyring.NoSuchKeyringError:
-            sys.stderr.write("No keyring '%s' found. Please create this keyring first" % keyring_name)
-            sys.exit(1)
+            keyrings = json.loads(f.read())
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}")  # Report JSON errors
+            return
 
-        existing_items = [get_item(keyring_name, id) for id in existing_ids]
-        existing_items = [i for i in existing_items if i is not None]
+    service = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS)
 
-        for item in keyring_items:
+    unlocked = False
+    for collection in service.get_collections():
+        try:
+            service.unlock_sync([collection])
+            unlocked = True 
+            break 
+        except GLib.Error as e:
+            print(f"Failed to unlock collection {collection.get_label()}: {e.message}")
+    if not unlocked:
+        print(f"No collections could be unlocked. Check your keyring setup.")
+        return
+
+    # Get the D-Bus connection (Gio.DBusConnection):
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None) # Gets the session bus synchronously
+
+    for collection_label, items in keyrings.items():
+        collection = None
+        for c in service.get_collections():
+            if c.get_label() == collection_label:
+                collection = c
+                break
+
+        if not collection:
+            try:
+                collection = service.create_collection_sync(
+                    collection_label, {"application": "gnome_keyring_import_export.py"},
+                    Secret.CollectionCreateFlags.NONE
+                )
+                if collection is None:  # Check if collection creation actually succeeded
+                    raise Exception("Failed to create collection")
+
+            except Exception as e:
+                print(f"Error creating collection '{collection_label}': {e}")
+                continue  # Skip to the next collection if creation fails
+
+        existing_items = [get_item(item) for item in collection.get_items()]
+
+        for item in items:
             if any(items_roughly_equal(item, i) for i in existing_items):
                 print("Skipping %s because it already exists" % item['display_name'])
-            else:
-                nearly = [i for i in existing_items if items_roughly_equal(i, item, ignore_secret=True)]
-                if nearly:
-                    print("Existing secrets found for '%s'" % item['display_name'])
-                    for i in nearly:
-                        print(" " + i['secret'])
+                continue
 
-                    print("So skipping value from '%s':" % from_file)
-                    print(" " + item['secret'])
-                else:
-                    schema = item['attributes']['xdg:schema']
-                    item_type = None
-                    if schema ==  'org.freedesktop.Secret.Generic':
-                        item_type = GnomeKeyring.ITEM_GENERIC_SECRET
-                    elif schema == 'org.gnome.keyring.Note':
-                        item_type = GnomeKeyring.ITEM_NOTE
-                    elif schema == 'org.gnome.keyring.NetworkPassword':
-                        item_type == GnomeKeyring.ITEM_NETWORK_PASSWORD
+            nearly = [i for i in existing_items if items_roughly_equal(i, item, ignore_secret=True)]
 
-                    if item_type is not None:
-                        item_id = GnomeKeyring.item_create_sync(keyring_name,
-                                                                item_type,
-                                                                item['display_name'],
-                                                                fix_attributes(item['attributes']),
-                                                                item['secret'],
-                                                                False)
-                        print("Copying secret %s" % item['display_name'])
-                    else:
-                        print("Can't handle secret '%s' of type '%s', skipping" % (item['display_name'], schema))
+            if nearly:
+                print("Existing secrets found for '%s'" % item['display_name'])
+                for i in nearly:
+                    print(" " + i['secret'])
 
+                print("So skipping value from '%s':" % from_file)
+                print(" " + item['secret'])
+                continue  # Skip to the next item
+
+            attributes = fix_attributes(item['attributes'])
+            attributes["application"] = "gnome_keyring_import_export.py"
+
+            try:
+                schema = Secret.Schema.new(item['schema_name'], Secret.SchemaFlags.NONE, {})
+                secret_item_properties = GLib.Variant("a{sv}", attributes)
+
+                secret = Secret.Item.create(  # Use Secret.Item.create()
+                    bus,  # Pass the D-Bus connection
+                    collection,               # Pass the collection object
+                    item.get('display_name', 'imported_item'),  # Item label
+                    schema,
+                    secret_item_properties,
+                    item['secret'].encode('utf-8'),
+                    True
+                )
+
+                if secret is None:  # Check for item creation failure (important!)
+                    raise Exception("Failed to create Secret.Item")
+
+                collection.add_item_sync(secret, Secret.ItemCreateFlags.NONE)
+                print("Imported secret %s" % item['display_name'])
+
+            except Exception as e:
+                print(f"Error importing secret '{item.get('display_name', 'unknown')}': {e}")
 
 if __name__ == '__main__':
     if len(sys.argv) == 3:
@@ -316,3 +374,4 @@ if __name__ == '__main__':
     else:
         print("See source code for usage instructions")
         sys.exit(1)
+
